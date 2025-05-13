@@ -16,9 +16,9 @@ from ebtorch.nn import WideResNet
 from ebtorch.nn.utils import BestModelSaver
 from ebtorch.nn.utils import eval_model_on_test
 from ebtorch.nn.utils import TelegramBotEcho as TBE
+from ebtorch.optim import lahdopt
 from ebtorch.optim import Lookahead
 from ebtorch.optim import MultiPhaseScheduler
-from ebtorch.optim import ralah_optim
 from fastai.vision.models.xresnet import xse_resnext50
 from torch import nn
 from torch import Tensor
@@ -193,13 +193,13 @@ def main_run(args: argparse.Namespace) -> None:
     )
 
     # Optimizer instantiation
-    optimizer: Optimizer = ralah_optim(
+    optimizer: Optimizer = lahdopt(
         parameters=model.parameters(),
-        radam_lr=LR_INIT,
+        ad_lr=LR_INIT,
         la_steps=6,
         la_alpha=0.5,
-        radam_betas=(0.95, 0.99),
-        radam_eps=1e-6,
+        ad_betas=(0.95, 0.99),
+        ad_eps=1e-6,
     )
 
     # LR scheduler instantiation
@@ -271,20 +271,13 @@ def main_run(args: argparse.Namespace) -> None:
             scheduler.step()
 
         # Evaluation
-        if isinstance(optimizer, Lookahead):
-            # noinspection PyProtectedMember
-            optimizer._backup_and_load_cache()
-
-        testacc: float = eval_model_on_test(
-            model=model,
-            test_data_loader=test_dl,
-            device=th.device(device),
-            verbose=True,
-        )
-
-        if isinstance(optimizer, Lookahead):
-            # noinspection PyProtectedMember
-            optimizer._clear_and_load_backup()
+        with optimizer.slow_weights():
+            testacc: float = eval_model_on_test(
+                model=model,
+                test_data_loader=test_dl,
+                device=th.device(device),
+                verbose=True,
+            )
         # ──────────────────────────────────────────────────────────────────────
 
         # Wandb logging
@@ -309,20 +302,13 @@ def main_run(args: argparse.Namespace) -> None:
                     step=eidx,
                 )
                 if args.save:
-                    if isinstance(optimizer, Lookahead):
-                        # noinspection PyProtectedMember
-                        optimizer._backup_and_load_cache()
-
-                    # noinspection PyUnboundLocalVariable
-                    _ = modelsaver(
-                        model.module if args.dist else model,
-                        wandb_acc.item(),
-                        eidx,
-                    )
-
-                    if isinstance(optimizer, Lookahead):
-                        # noinspection PyProtectedMember
-                        optimizer._clear_and_load_backup()
+                    with optimizer.slow_weights():
+                        # noinspection PyUnboundLocalVariable
+                        _ = modelsaver(
+                            model.module if args.dist else model,
+                            wandb_acc.item(),
+                            eidx,
+                        )
     # ──────────────────────────────────────────────────────────────────────────
     # noinspection DuplicatedCode
     if args.wandb and local_rank == 0:
