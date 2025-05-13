@@ -9,50 +9,45 @@ import torch as th
 import torch.distributed as dist
 import torch.nn.functional as F
 import wandb
-from ebtorch.data import cifarhundred_dataloader_dispatcher
-from ebtorch.data import cifarten_dataloader_dispatcher
+from ebtorch.data import data_prep_dispatcher_3ch
+from ebtorch.data import imagenette_dataloader_dispatcher
 from ebtorch.distributed import slurm_nccl_env
 from ebtorch.nn import WideResNet
-from ebtorch.nn.architectures_resnets_dm import CIFAR100_MEAN
-from ebtorch.nn.architectures_resnets_dm import CIFAR100_STD
-from ebtorch.nn.architectures_resnets_dm import CIFAR10_MEAN
-from ebtorch.nn.architectures_resnets_dm import CIFAR10_STD
 from ebtorch.nn.utils import BestModelSaver
 from ebtorch.nn.utils import eval_model_on_test
 from ebtorch.nn.utils import TelegramBotEcho as TBE
+from ebtorch.optim import Lookahead
 from ebtorch.optim import MultiPhaseScheduler
+from ebtorch.optim import ralah_optim
+from fastai.vision.models.xresnet import xse_resnext50
 from torch import nn
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Optimizer
-from torch.optim import SGD
 from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 from tqdm.auto import trange
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-MODEL_NAME: str = "WRN_28_10"
-DATASET_NAME: str = "cifar-"
+MODEL_NAME: str = "XSEResNeXt-50"
+DATASET_NAME: str = "ImageNette"
 SINGLE_GPU_WORKERS: int = 8
 
 # Constant points for the LR schedule
-LR_INIT: float = 5e-6
-LR_FINAL: float = 1e-4
+LR_INIT: float = 8e-3
+LR_FINAL: float = LR_INIT / 1e5
 
 # Variable points for the LR schedule
-SCALING_H: float = 1.0
-SCALING_V: float = 1.0
-LR_PEAK: float = 0.045
-EP_WU: int = 40
-EP_AN: int = 80
+EP_WU: int = 150
+EP_AN: int = 200 - EP_WU
 
 # ──────────────────────────────────────────────────────────────────────────────
 
 
 def main_parse() -> argparse.Namespace:
     parser: argparse.ArgumentParser = argparse.ArgumentParser(
-        description=f"Training {MODEL_NAME} on {DATASET_NAME}*"
+        description=f"Training {MODEL_NAME} on {DATASET_NAME}"
     )
     # noinspection DuplicatedCode
     parser.add_argument(
@@ -89,16 +84,9 @@ def main_parse() -> argparse.Namespace:
     parser.add_argument(
         "--batchsize",
         type=int,
-        default=128,
+        default=64,
         metavar="<batch_size>",
-        help="Batch size for training (default: 128)",
-    )
-    parser.add_argument(
-        "--dataset",
-        type=str,
-        default="cifarten",
-        metavar="<dataset>",
-        help="Dataset to train on (default: cifarten)",
+        help="Batch size for training (default: 64)",
     )
     return parser.parse_args()
 
@@ -130,30 +118,16 @@ def main_run(args: argparse.Namespace) -> None:
     # Telegram notification machinery
     if args.tgnotif and local_rank == 0:
         ebdltgb = TBE("EBDL_TGB_TOKEN", "EBDL_TGB_CHTID")
-        ebdltgb.send(f"Training started ({args.dataset})!")
+        ebdltgb.send("Training started (ImageNette)!")
 
     # Data loading
     batchsize: int = int(max(args.batchsize // world_size, world_size))
 
-    if args.dataset == "cifarten":
-        dataset_dispatcher = cifarten_dataloader_dispatcher
-        datamean: Tuple[float, float, float] = CIFAR10_MEAN
-        datastd: Tuple[float, float, float] = CIFAR10_STD
-        nclasses: int = 10
-    elif args.dataset == "cifarhundred":
-        datamean: Tuple[float, float, float] = CIFAR100_MEAN
-        datastd: Tuple[float, float, float] = CIFAR100_STD
-        nclasses: int = 100
-        dataset_dispatcher = cifarhundred_dataloader_dispatcher
-    else:
-        raise ValueError(f"Unknown dataset: {args.dataset}")
-
-    train_dl, test_dl, _ = dataset_dispatcher(
+    train_dl, test_dl, _ = imagenette_dataloader_dispatcher(
         batch_size_train=batchsize,
-        batch_size_test=4 * batchsize,
+        batch_size_test=2 * batchsize,
         cuda_accel=(device == th.device("cuda") or args.dist),
         unshuffle_train=args.dist,
-        augment_train=True,
         dataloader_kwargs=(
             {"num_workers": cpus_per_task, "persistent_workers": True}
             if not args.dist
@@ -162,19 +136,18 @@ def main_run(args: argparse.Namespace) -> None:
     )
 
     if args.dist:
-        train_dl, _, _ = dataset_dispatcher(
+        train_dl, _, _ = imagenette_dataloader_dispatcher(
             batch_size_train=batchsize,
             batch_size_test=1,
             cuda_accel=True,
             unshuffle_train=True,
-            augment_train=True,
             dataloader_kwargs={
                 "sampler": DistributedSampler(train_dl.dataset),
                 "num_workers": cpus_per_task,
                 "persistent_workers": True,
             },
         )
-        _, test_dl, _ = dataset_dispatcher(
+        _, test_dl, _ = imagenette_dataloader_dispatcher(
             batch_size_train=1,
             batch_size_test=4 * batchsize,
             cuda_accel=True,
@@ -188,8 +161,18 @@ def main_run(args: argparse.Namespace) -> None:
         del _
 
     # Model instantiation
-    model: nn.Module = WideResNet(num_classes=nclasses, mean=datamean, std=datastd)
-    cf.apply_blurpool(model, replace_convs=True, replace_maxpools=True, blur_first=True)
+    inner_model: nn.Module = xse_resnext50(n_out=10, pretrained=False, sa=True)
+    cf.apply_blurpool(
+        inner_model,
+        replace_convs=True,
+        replace_maxpools=True,
+        blur_first=True,
+        min_channels=4,
+    )
+    model: nn.Module = nn.Sequential(
+        data_prep_dispatcher_3ch(device=device, post_flatten=False, dataset="imagenet"),
+        inner_model,
+    )
     # noinspection DuplicatedCode
     model: nn.Module = model.to(device).train()
 
@@ -210,13 +193,13 @@ def main_run(args: argparse.Namespace) -> None:
     )
 
     # Optimizer instantiation
-    optimizer: Optimizer = SGD(
-        params=model.parameters(),
-        lr=LR_PEAK,
-        momentum=0.9,
-        weight_decay=5e-4,
-        nesterov=True,
-        fused=(device == th.device("cuda") or args.dist),
+    optimizer: Optimizer = ralah_optim(
+        parameters=model.parameters(),
+        radam_lr=LR_INIT,
+        la_steps=6,
+        la_alpha=0.5,
+        radam_betas=(0.95, 0.99),
+        radam_eps=1e-6,
     )
 
     # LR scheduler instantiation
@@ -224,11 +207,9 @@ def main_run(args: argparse.Namespace) -> None:
         optim=optimizer,
         init_lr=LR_INIT,
         final_lr=LR_FINAL,
-        warmup_steps=EP_WU,
-        steady_lr=LR_PEAK,
-        steady_steps=0,
+        steady_lr=LR_INIT,
+        steady_steps=EP_WU,
         anneal_steps=EP_AN,
-        cos_warmup=True,
         cos_annealing=True,
         step_dilation=len(train_dl),
     )
@@ -239,14 +220,13 @@ def main_run(args: argparse.Namespace) -> None:
             project="semigood-baselines",
             config={
                 "model": MODEL_NAME,
-                "dataset": args.dataset,
-                "nclasses": nclasses,
+                "dataset": "imagenette",
+                "nclasses": 10,
                 "batch_size": batchsize * world_size,
                 "epochs": args.epochs,
                 "lr_init": LR_INIT,
                 "lr_final": LR_FINAL,
-                "lr_peak": LR_PEAK,
-                "ep_warmup": EP_WU,
+                "ep_steady": EP_WU,
                 "ep_anealing": EP_AN,
             },
         )
@@ -256,7 +236,7 @@ def main_run(args: argparse.Namespace) -> None:
     # ──────────────────────────────────────────────────────────────────────────
     if args.save and local_rank == 0:
         modelsaver: BestModelSaver = BestModelSaver(
-            name=f"{MODEL_NAME}_{args.dataset}", from_epoch=20, path="../checkpoints"
+            name=f"{MODEL_NAME}_imagenette", from_epoch=130, path="../checkpoints"
         )
 
     # noinspection DuplicatedCode
@@ -287,15 +267,24 @@ def main_run(args: argparse.Namespace) -> None:
             loss = unsc_loss * world_size  # DDP averages .grad, compute sum!
             loss.backward()
             optimizer.step()
+
             scheduler.step()
 
         # Evaluation
+        if isinstance(optimizer, Lookahead):
+            # noinspection PyProtectedMember
+            optimizer._backup_and_load_cache()
+
         testacc: float = eval_model_on_test(
             model=model,
             test_data_loader=test_dl,
             device=th.device(device),
             verbose=True,
         )
+
+        if isinstance(optimizer, Lookahead):
+            # noinspection PyProtectedMember
+            optimizer._clear_and_load_backup()
         # ──────────────────────────────────────────────────────────────────────
 
         # Wandb logging
@@ -320,12 +309,20 @@ def main_run(args: argparse.Namespace) -> None:
                     step=eidx,
                 )
                 if args.save:
+                    if isinstance(optimizer, Lookahead):
+                        # noinspection PyProtectedMember
+                        optimizer._backup_and_load_cache()
+
                     # noinspection PyUnboundLocalVariable
                     _ = modelsaver(
                         model.module if args.dist else model,
                         wandb_acc.item(),
                         eidx,
                     )
+
+                    if isinstance(optimizer, Lookahead):
+                        # noinspection PyProtectedMember
+                        optimizer._clear_and_load_backup()
     # ──────────────────────────────────────────────────────────────────────────
     # noinspection DuplicatedCode
     if args.wandb and local_rank == 0:
