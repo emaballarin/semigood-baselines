@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 # ──────────────────────────────────────────────────────────────────────────────
 import argparse
+from typing import Optional
 from typing import Tuple
 
 import composer.functional as cf
@@ -9,6 +10,7 @@ import torch as th
 import torch.distributed as dist
 import torch.nn.functional as F
 import wandb
+from advertorch.attacks import LinfPGDAttack
 from ebtorch.data import data_prep_dispatcher_3ch
 from ebtorch.data import imagenette_dataloader_dispatcher
 from ebtorch.distributed import slurm_nccl_env
@@ -87,6 +89,12 @@ def main_parse() -> argparse.Namespace:
         default=64,
         metavar="<batch_size>",
         help="Batch size for training (default: 64)",
+    )
+    parser.add_argument(
+        "--advatk",
+        action="store_true",
+        default=False,
+        help="Perform adversarial training (default: False)",
     )
     return parser.parse_args()
 
@@ -200,6 +208,8 @@ def main_run(args: argparse.Namespace) -> None:
         la_alpha=0.5,
         ad_betas=(0.95, 0.99),
         ad_eps=1e-6,
+        ad_decouple=True,
+        ad_weight_decay=0.01,
     )
 
     # LR scheduler instantiation
@@ -213,6 +223,16 @@ def main_run(args: argparse.Namespace) -> None:
         cos_annealing=True,
         step_dilation=len(train_dl),
     )
+
+    # Adversarial attacker
+    if args.advatk:
+        adversary: Optional[LinfPGDAttack] = LinfPGDAttack(
+            model,
+            loss_fn=th.nn.CrossEntropyLoss(reduction="mean"),
+            eps=8 / 255,
+        )
+    else:
+        adversary: Optional[LinfPGDAttack] = None
 
     # Wandb initialization
     if args.wandb and local_rank == 0:
@@ -236,7 +256,9 @@ def main_run(args: argparse.Namespace) -> None:
     # ──────────────────────────────────────────────────────────────────────────
     if args.save and local_rank == 0:
         modelsaver: BestModelSaver = BestModelSaver(
-            name=f"{MODEL_NAME}_imagenette", from_epoch=130, path="../checkpoints"
+            name=f"{MODEL_NAME}_imagenette" + f"{'_adv' if args.advatk else ''}",
+            from_epoch=130,
+            path="../checkpoints",
         )
 
     # noinspection DuplicatedCode
@@ -258,6 +280,11 @@ def main_run(args: argparse.Namespace) -> None:
             batched_x: Tensor = batched_x.to(device)
             batched_y: Tensor = batched_y.to(device)
 
+            # Adversarial attacks genetarion
+            if adversary is not None:
+                batched_x = adversary.perturb(batched_x, batched_y)
+
+            # noinspection DuplicatedCode
             batched_xm, batched_yp, mixing = cf.mixup_batch(batched_x, batched_y)
             optimizer.zero_grad()
             batched_yhat: Tensor = model(batched_xm)
@@ -324,7 +351,7 @@ def main_run(args: argparse.Namespace) -> None:
         bacc = modelsaver.best_metric if args.save else "N.A."
         # noinspection PyUnboundLocalVariable
         ebdltgb.send(
-            f"Training ended ({args.dataset})!\nFinal accuracy:{facc}\nBest accuracy:{bacc}"
+            f"Training ended (ImageNette)!\nFinal accuracy:{facc}\nBest accuracy:{bacc}"
         )
 
 
