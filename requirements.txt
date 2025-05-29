@@ -1,6 +1,6 @@
 --extra-index-url https://fury.ballarin.cc/pypi
 advertorch>=0.2.4    # Built from: https://github.com/BorealisAI/advertorch.git@master
-ebtorch>=0.33
+ebtorch>=0.33.3
 fastai>=2.8.1
 mosaicml>=0.30
 torch>=2.7

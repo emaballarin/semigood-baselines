@@ -2,26 +2,22 @@
 # -*- coding: utf-8 -*-
 # ──────────────────────────────────────────────────────────────────────────────
 import argparse
-from typing import Optional
 
-import composer.functional as cf
 import torch as th
 import torch.distributed as dist
 import torch.nn.functional as F
 import wandb
-from advertorch.attacks import LinfPGDAttack
-from ebtorch.data import data_prep_dispatcher_3ch
-from ebtorch.data import imagenette_dataloader_dispatcher
+from ebtorch.data import data_prep_dispatcher_1ch
+from ebtorch.data import mnist_dataloader_dispatcher
 from ebtorch.distributed import slurm_nccl_env
 from ebtorch.nn.utils import BestModelSaver
 from ebtorch.nn.utils import eval_model_on_test
 from ebtorch.nn.utils import TelegramBotEcho as TBE
-from ebtorch.optim import lahdopt
 from ebtorch.optim import MultiPhaseScheduler
-from fastai.vision.models.xresnet import xse_resnext50
 from torch import nn
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.optim import Adam
 from torch.optim import Optimizer
 from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
@@ -29,26 +25,20 @@ from tqdm.auto import trange
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-MODEL_NAME: str = "XSEResNeXt-50"
-DATASET_NAME: str = "ImageNette"
+MODEL_NAME: str = "FCNMicro"
+DATASET_NAME: str = "MNIST"
 SINGLE_GPU_WORKERS: int = 8
 
-# Constant points for the LR schedule
-LR_INIT: float = 8e-3
-LR_FINAL: float = LR_INIT / 1e5
-
-# Variable points for the LR schedule
-EP_WU: int = 150
-EP_AN: int = 200 - EP_WU
+EPN: int = 60
 
 # ──────────────────────────────────────────────────────────────────────────────
 
 
 def main_parse() -> argparse.Namespace:
+    # noinspection DuplicatedCode
     parser: argparse.ArgumentParser = argparse.ArgumentParser(
         description=f"Training {MODEL_NAME} on {DATASET_NAME}"
     )
-    # noinspection DuplicatedCode
     parser.add_argument(
         "--dist",
         action="store_true",
@@ -76,9 +66,9 @@ def main_parse() -> argparse.Namespace:
     parser.add_argument(
         "--epochs",
         type=int,
-        default=EP_WU + EP_AN,
+        default=EPN,
         metavar="<epochs>",
-        help=f"Number of epochs to train for (default: {EP_WU + EP_AN})",
+        help=f"Number of epochs to train for (default: {EPN})",
     )
     parser.add_argument(
         "--batchsize",
@@ -86,12 +76,6 @@ def main_parse() -> argparse.Namespace:
         default=64,
         metavar="<batch_size>",
         help="Batch size for training (default: 64)",
-    )
-    parser.add_argument(
-        "--advatk",
-        action="store_true",
-        default=False,
-        help="Perform adversarial training (default: False)",
     )
     return parser.parse_args()
 
@@ -123,16 +107,17 @@ def main_run(args: argparse.Namespace) -> None:
     # Telegram notification machinery
     if args.tgnotif and local_rank == 0:
         ebdltgb = TBE("EBDL_TGB_TOKEN", "EBDL_TGB_CHTID")
-        ebdltgb.send("Training started (ImageNette)!")
+        ebdltgb.send("Training started (MNIST)!")
 
     # Data loading
     batchsize: int = int(max(args.batchsize // world_size, world_size))
 
-    train_dl, test_dl, _ = imagenette_dataloader_dispatcher(
+    train_dl, test_dl, _ = mnist_dataloader_dispatcher(
         batch_size_train=batchsize,
         batch_size_test=2 * batchsize,
         cuda_accel=(device == th.device("cuda") or args.dist),
         unshuffle_train=args.dist,
+        augment_train=True,
         dataloader_kwargs=(
             {"num_workers": cpus_per_task, "persistent_workers": True}
             if not args.dist
@@ -140,19 +125,21 @@ def main_run(args: argparse.Namespace) -> None:
         ),
     )
 
+    # noinspection DuplicatedCode
     if args.dist:
-        train_dl, _, _ = imagenette_dataloader_dispatcher(
+        train_dl, _, _ = mnist_dataloader_dispatcher(
             batch_size_train=batchsize,
             batch_size_test=1,
             cuda_accel=True,
             unshuffle_train=True,
+            augment_train=True,
             dataloader_kwargs={
                 "sampler": DistributedSampler(train_dl.dataset),
                 "num_workers": cpus_per_task,
                 "persistent_workers": True,
             },
         )
-        _, test_dl, _ = imagenette_dataloader_dispatcher(
+        _, test_dl, _ = mnist_dataloader_dispatcher(
             batch_size_train=1,
             batch_size_test=4 * batchsize,
             cuda_accel=True,
@@ -166,23 +153,19 @@ def main_run(args: argparse.Namespace) -> None:
         del _
 
     # Model instantiation
-    inner_model: nn.Module = xse_resnext50(n_out=10, pretrained=False, sa=True)
-    cf.apply_blurpool(
-        inner_model,
-        replace_convs=True,
-        replace_maxpools=True,
-        blur_first=True,
-        min_channels=4,
+    inner_model: nn.Module = nn.Sequential(
+        nn.Linear(784, 397),
+        nn.Mish(),
+        nn.Linear(397, 10),
     )
     model: nn.Module = nn.Sequential(
-        data_prep_dispatcher_3ch(device=device, post_flatten=False, dataset="imagenet"),
+        data_prep_dispatcher_1ch(device=device, post_flatten=True, dataset="mnist"),
         inner_model,
     )
     # noinspection DuplicatedCode
     model: nn.Module = model.to(device).train()
 
     if args.dist:
-        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
         model.to(device)
         model = DDP(
             model,
@@ -198,38 +181,16 @@ def main_run(args: argparse.Namespace) -> None:
     )
 
     # Optimizer instantiation
-    optimizer: Optimizer = lahdopt(
-        parameters=model.parameters(),
-        ad_lr=LR_INIT,
-        la_steps=6,
-        la_alpha=0.5,
-        ad_betas=(0.95, 0.99),
-        ad_eps=1e-6,
-        ad_decouple=True,
-        ad_weight_decay=0.01,
-    )
-
-    # LR scheduler instantiation
-    scheduler = MultiPhaseScheduler(
-        optim=optimizer,
-        init_lr=LR_INIT,
-        final_lr=LR_FINAL,
-        steady_lr=LR_INIT,
-        steady_steps=EP_WU,
-        anneal_steps=EP_AN,
-        cos_annealing=True,
+    optimizer: Optimizer = Adam(model.parameters(), lr=5e-4, weight_decay=5e-5)
+    scheduler: MultiPhaseScheduler = MultiPhaseScheduler(
+        optimizer,
+        init_lr=5e-4,
+        final_lr=1e-5,
+        steady_lr=5e-4,
+        steady_steps=EPN // 3,
+        anneal_steps=EPN - EPN // 3,
         step_dilation=len(train_dl),
     )
-
-    # Adversarial attacker
-    if args.advatk:
-        adversary: Optional[LinfPGDAttack] = LinfPGDAttack(
-            model,
-            loss_fn=th.nn.CrossEntropyLoss(reduction="mean"),
-            eps=8 / 255,
-        )
-    else:
-        adversary: Optional[LinfPGDAttack] = None
 
     # Wandb initialization
     if args.wandb and local_rank == 0:
@@ -237,14 +198,10 @@ def main_run(args: argparse.Namespace) -> None:
             project="semigood-baselines",
             config={
                 "model": MODEL_NAME,
-                "dataset": "imagenette",
+                "dataset": "mnist",
                 "nclasses": 10,
                 "batch_size": batchsize * world_size,
                 "epochs": args.epochs,
-                "lr_init": LR_INIT,
-                "lr_final": LR_FINAL,
-                "ep_steady": EP_WU,
-                "ep_anealing": EP_AN,
             },
         )
 
@@ -253,8 +210,8 @@ def main_run(args: argparse.Namespace) -> None:
     # ──────────────────────────────────────────────────────────────────────────
     if args.save and local_rank == 0:
         modelsaver: BestModelSaver = BestModelSaver(
-            name=f"{MODEL_NAME}_imagenette" + f"{'_adv' if args.advatk else ''}",
-            from_epoch=130,
+            name=f"{MODEL_NAME}_mnist",
+            from_epoch=-1,
             path="../checkpoints",
         )
 
@@ -276,37 +233,27 @@ def main_run(args: argparse.Namespace) -> None:
         ):
             batched_x: Tensor = batched_x.to(device)
             batched_y: Tensor = batched_y.to(device)
-
-            # Adversarial attacks genetarion
-            if adversary is not None:
-                batched_x = adversary.perturb(batched_x, batched_y)
-
-            # noinspection DuplicatedCode
-            batched_xm, batched_yp, mixing = cf.mixup_batch(batched_x, batched_y)
             optimizer.zero_grad()
-            batched_yhat: Tensor = model(batched_xm)
-            unsc_loss: Tensor = (1 - mixing) * criterion(
-                batched_yhat, batched_y
-            ) + mixing * criterion(batched_yhat, batched_yp)
+            batched_yhat: Tensor = model(batched_x)
+            unsc_loss: Tensor = criterion(batched_yhat, batched_y)
             loss = unsc_loss * world_size  # DDP averages .grad, compute sum!
             loss.backward()
             optimizer.step()
-
             scheduler.step()
 
         # Evaluation
-        with optimizer.slow_weights():
-            testacc: float = eval_model_on_test(
-                model=model,
-                test_data_loader=test_dl,
-                device=th.device(device),
-                verbose=True,
-            )
+        testacc: float = eval_model_on_test(
+            model=model,
+            test_data_loader=test_dl,
+            device=th.device(device),
+            verbose=True,
+        )
+        print(f"\tTest accuracy: {testacc:.4f}\t")
         # ──────────────────────────────────────────────────────────────────────
 
         # Wandb logging
+        # noinspection DuplicatedCode
         if args.wandb:
-            # noinspection DuplicatedCode
             wandb_loss: Tensor = unsc_loss.detach()
             wandb_acc: Tensor = th.tensor(testacc, device=device).detach()
 
@@ -326,13 +273,12 @@ def main_run(args: argparse.Namespace) -> None:
                     step=eidx,
                 )
                 if args.save:
-                    with optimizer.slow_weights():
-                        # noinspection PyUnboundLocalVariable
-                        _ = modelsaver(
-                            model.module if args.dist else model,
-                            wandb_acc.item(),
-                            eidx,
-                        )
+                    # noinspection PyUnboundLocalVariable
+                    _ = modelsaver(
+                        model.module if args.dist else model,
+                        wandb_acc.item(),
+                        eidx,
+                    )
     # ──────────────────────────────────────────────────────────────────────────
     # noinspection DuplicatedCode
     if args.wandb and local_rank == 0:
@@ -348,7 +294,7 @@ def main_run(args: argparse.Namespace) -> None:
         bacc = modelsaver.best_metric if args.save else "N.A."
         # noinspection PyUnboundLocalVariable
         ebdltgb.send(
-            f"Training ended (ImageNette)!\nFinal accuracy:{facc}\nBest accuracy:{bacc}"
+            f"Training ended (MNIST)!\nFinal accuracy:{facc}\nBest accuracy:{bacc}"
         )
 
 
