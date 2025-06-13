@@ -3,6 +3,7 @@
 # ──────────────────────────────────────────────────────────────────────────────
 import argparse
 
+import composer.functional as cf
 import torch as th
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -18,15 +19,14 @@ from torch import nn
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Adam
-from torch.optim import Optimizer
 from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 from tqdm.auto import trange
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-MODEL_NAME: str = "FCNMicro"
-DATASET_NAME: str = "MNIST"
+MODEL_NAME: str = "MicroCNN"
+DATASET_NAME: str = "mnist"
 SINGLE_GPU_WORKERS: int = 8
 
 EPN: int = 60
@@ -35,7 +35,6 @@ EPN: int = 60
 
 
 def main_parse() -> argparse.Namespace:
-    # noinspection DuplicatedCode
     parser: argparse.ArgumentParser = argparse.ArgumentParser(
         description=f"Training {MODEL_NAME} on {DATASET_NAME}"
     )
@@ -84,7 +83,6 @@ def main_parse() -> argparse.Namespace:
 def main_run(args: argparse.Namespace) -> None:
 
     # Distributed setup / Device selection
-    # noinspection DuplicatedCode
     if args.dist:
         (
             rank,
@@ -114,7 +112,7 @@ def main_run(args: argparse.Namespace) -> None:
 
     train_dl, test_dl, _ = mnist_dataloader_dispatcher(
         batch_size_train=batchsize,
-        batch_size_test=2 * batchsize,
+        batch_size_test=4 * batchsize,
         cuda_accel=(device == th.device("cuda") or args.dist),
         unshuffle_train=args.dist,
         augment_train=True,
@@ -125,7 +123,6 @@ def main_run(args: argparse.Namespace) -> None:
         ),
     )
 
-    # noinspection DuplicatedCode
     if args.dist:
         train_dl, _, _ = mnist_dataloader_dispatcher(
             batch_size_train=batchsize,
@@ -154,15 +151,31 @@ def main_run(args: argparse.Namespace) -> None:
 
     # Model instantiation
     inner_model: nn.Module = nn.Sequential(
-        nn.Linear(784, 397),
-        nn.Mish(),
-        nn.Linear(397, 10),
+        nn.Conv2d(in_channels=1, out_channels=64, kernel_size=5, padding=2),
+        nn.ReLU(),
+        nn.MaxPool2d(kernel_size=2, stride=2),
+        nn.Dropout2d(p=0.3),
+        nn.Conv2d(in_channels=64, out_channels=128, kernel_size=3, stride=1, padding=1),
+        nn.ReLU(),
+        nn.MaxPool2d(kernel_size=4, stride=4, padding=1),
+        nn.Dropout(p=0.3),
+        nn.Flatten(),
+        nn.Linear(2048, 256),
+        nn.ReLU(),
+        nn.Dropout(p=0.3),
+        nn.Linear(256, 10),
+    )
+    cf.apply_blurpool(
+        inner_model,
+        replace_convs=True,
+        replace_maxpools=True,
+        blur_first=True,
+        min_channels=4,
     )
     model: nn.Module = nn.Sequential(
-        data_prep_dispatcher_1ch(device=device, post_flatten=True, dataset="mnist"),
+        data_prep_dispatcher_1ch(device=device, post_flatten=False, dataset="mnist"),
         inner_model,
     )
-    # noinspection DuplicatedCode
     model: nn.Module = model.to(device).train()
 
     if args.dist:
@@ -181,11 +194,11 @@ def main_run(args: argparse.Namespace) -> None:
     )
 
     # Optimizer instantiation
-    optimizer: Optimizer = Adam(model.parameters(), lr=5e-4, weight_decay=5e-5)
+    optimizer: Adam = Adam(model.parameters(), lr=5e-4, weight_decay=5e-5)
     scheduler: MultiPhaseScheduler = MultiPhaseScheduler(
         optimizer,
         init_lr=5e-4,
-        final_lr=1e-5,
+        final_lr=1e-6,
         steady_lr=5e-4,
         steady_steps=EPN // 3,
         anneal_steps=EPN - EPN // 3,
@@ -211,15 +224,13 @@ def main_run(args: argparse.Namespace) -> None:
     if args.save and local_rank == 0:
         modelsaver: BestModelSaver = BestModelSaver(
             name=f"{MODEL_NAME}_mnist",
-            from_epoch=-1,
+            from_epoch=0,
             path="../checkpoints",
         )
 
-    # noinspection DuplicatedCode
     unsc_loss: Tensor = th.tensor(0.0, device=device)
     for eidx in trange(args.epochs, desc="Training epoch", disable=(local_rank != 0)):
 
-        # noinspection DuplicatedCode
         if args.dist:
             train_dl.sampler.set_epoch(eidx)  # type: ignore
 
@@ -233,9 +244,13 @@ def main_run(args: argparse.Namespace) -> None:
         ):
             batched_x: Tensor = batched_x.to(device)
             batched_y: Tensor = batched_y.to(device)
+
+            batched_xm, batched_yp, mixing = cf.mixup_batch(batched_x, batched_y)
             optimizer.zero_grad()
-            batched_yhat: Tensor = model(batched_x)
-            unsc_loss: Tensor = criterion(batched_yhat, batched_y)
+            batched_yhat: Tensor = model(batched_xm)
+            unsc_loss: Tensor = (1 - mixing) * criterion(
+                batched_yhat, batched_y
+            ) + mixing * criterion(batched_yhat, batched_yp)
             loss = unsc_loss * world_size  # DDP averages .grad, compute sum!
             loss.backward()
             optimizer.step()
@@ -248,11 +263,10 @@ def main_run(args: argparse.Namespace) -> None:
             device=th.device(device),
             verbose=True,
         )
-        print(f"\tTest accuracy: {testacc:.4f}\t")
+        print(f"Epoch {eidx + 1} test accuracy: {testacc:.4f}")
         # ──────────────────────────────────────────────────────────────────────
 
         # Wandb logging
-        # noinspection DuplicatedCode
         if args.wandb:
             wandb_loss: Tensor = unsc_loss.detach()
             wandb_acc: Tensor = th.tensor(testacc, device=device).detach()
@@ -280,7 +294,6 @@ def main_run(args: argparse.Namespace) -> None:
                         eidx,
                     )
     # ──────────────────────────────────────────────────────────────────────────
-    # noinspection DuplicatedCode
     if args.wandb and local_rank == 0:
         wandb.finish()
     # ──────────────────────────────────────────────────────────────────────────
@@ -290,7 +303,6 @@ def main_run(args: argparse.Namespace) -> None:
     if args.tgnotif and local_rank == 0:
         # noinspection PyUnboundLocalVariable
         facc = wandb_acc.item() if args.wandb else "N.A."
-        # noinspection PyUnboundLocalVariable
         bacc = modelsaver.best_metric if args.save else "N.A."
         # noinspection PyUnboundLocalVariable
         ebdltgb.send(
