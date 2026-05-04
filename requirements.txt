@@ -5,6 +5,6 @@ fastai>=2.8.1
 mosaicml>=0.32.1
 torch>=2.11.0
 torchattacks>=3.5.1  # Built from: https://github.com/Harry24k/adversarial-attacks-pytorch.git@master
-torchvision>=0.17
+torchvision>=0.26.0
 tqdm>=4.67.3
 wandb>=0.26.1
