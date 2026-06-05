@@ -6,5 +6,5 @@ mosaicml>=0.32.1
 torch>=2.12.0
 torchattacks>=3.5.1  # Built from: https://github.com/Harry24k/adversarial-attacks-pytorch.git@master
 torchvision>=0.27.0
-tqdm>=4.67.3
+tqdm>=4.68.1
 wandb>=0.27.1
